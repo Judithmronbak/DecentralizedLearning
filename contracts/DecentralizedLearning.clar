@@ -382,3 +382,80 @@
         (ok post-id)
     )
 )
+
+(define-constant err-refund-period-expired (err u105))
+(define-constant refund-period-blocks u144) ;; ~24 hours in blocks
+
+(define-map RefundRequests
+    { student: principal, course-id: uint }
+    {
+        request-time: uint,
+        status: (string-ascii 20)
+    }
+)
+
+(define-public (request-refund (course-id uint))
+    (let
+        ((enrollment (unwrap! (get-enrollment tx-sender course-id) err-not-enrolled))
+         (course (unwrap! (get-course-by-id course-id) err-not-found))
+         (current-block stacks-block-height))
+        
+        (asserts! (<= (- current-block (get enrolled-at enrollment)) refund-period-blocks) err-refund-period-expired)
+        (asserts! (not (get completed enrollment)) err-already-completed)
+        
+        (map-insert RefundRequests
+            { student: tx-sender, course-id: course-id }
+            {
+                request-time: current-block,
+                status: "pending"
+            }
+        )
+        
+        (map-set Courses
+            { course-id: course-id }
+            (merge course { current-students: (- (get current-students course) u1) })
+        )
+        
+        (ok true)
+    )
+)
+
+
+(define-non-fungible-token course-certificate uint)
+
+(define-map CertificateMetadata
+    { certificate-id: uint }
+    {
+        course-id: uint,
+        student: principal,
+        issue-date: uint,
+        metadata-url: (string-ascii 256)
+    }
+)
+
+(define-data-var next-certificate-id uint u1)
+
+(define-public (mint-course-certificate (course-id uint) (metadata-url (string-ascii 256)))
+    (let
+        ((enrollment (unwrap! (get-enrollment tx-sender course-id) err-not-enrolled))
+         (certificate-id (var-get next-certificate-id)))
+        
+        (asserts! (get completed enrollment) err-not-enrolled)
+        
+        (try! (nft-mint? course-certificate certificate-id tx-sender))
+        
+        (map-insert CertificateMetadata
+            { certificate-id: certificate-id }
+            {
+                course-id: course-id,
+                student: tx-sender,
+                issue-date: stacks-block-height,
+                metadata-url: metadata-url
+            }
+        )
+        
+        (var-set next-certificate-id (+ certificate-id u1))
+        (ok certificate-id)
+    )
+)
+
