@@ -9,6 +9,34 @@
 (define-constant err-not-enrolled (err u103))
 (define-constant err-already-completed (err u104))
 
+
+(define-constant platform-fee-percentage u10)
+(define-constant err-insufficient-payment (err u106))
+(define-constant err-insufficient-balance (err u107))
+(define-constant err-payment-failed (err u108))
+
+(define-map InstructorBalances
+    { instructor: principal }
+    { balance: uint }
+)
+
+(define-map PlatformRevenue
+    { platform: bool }
+    { total-revenue: uint }
+)
+
+(define-map CoursePayments
+    { student: principal, course-id: uint }
+    {
+        amount-paid: uint,
+        payment-date: uint,
+        instructor-share: uint,
+        platform-share: uint
+    }
+)
+
+(define-data-var platform-balance uint u0)
+
 ;; Data Maps
 (define-map Courses 
     { course-id: uint }
@@ -459,3 +487,108 @@
     )
 )
 
+
+(define-public (enroll-with-payment (course-id uint))
+    (let
+        ((course (unwrap! (get-course-by-id course-id) err-not-found))
+         (course-price (get price course))
+         (instructor (get instructor course))
+         (platform-fee (/ (* course-price platform-fee-percentage) u100))
+         (instructor-share (- course-price platform-fee))
+         (current-block stacks-block-height))
+        
+        (asserts! (get active course) err-not-found)
+        (asserts! (< (get current-students course) (get max-students course)) err-already-exists)
+        (asserts! (> course-price u0) err-insufficient-payment)
+        
+        (try! (stx-transfer? course-price tx-sender (as-contract tx-sender)))
+        
+        (map-insert StudentEnrollments
+            { student: tx-sender, course-id: course-id }
+            {
+                enrolled-at: current-block,
+                completed: false,
+                progress: u0
+            }
+        )
+        
+        (map-set Courses
+            { course-id: course-id }
+            (merge course { current-students: (+ (get current-students course) u1) })
+        )
+        
+        (map-insert CoursePayments
+            { student: tx-sender, course-id: course-id }
+            {
+                amount-paid: course-price,
+                payment-date: current-block,
+                instructor-share: instructor-share,
+                platform-share: platform-fee
+            }
+        )
+        
+        (let ((current-instructor-balance (default-to u0 (get balance (map-get? InstructorBalances { instructor: instructor })))))
+            (map-set InstructorBalances
+                { instructor: instructor }
+                { balance: (+ current-instructor-balance instructor-share) }
+            )
+        )
+        
+        (var-set platform-balance (+ (var-get platform-balance) platform-fee))
+        
+        (ok true)
+    )
+)
+
+(define-public (withdraw-instructor-earnings)
+    (let
+        ((instructor-balance-data (unwrap! (map-get? InstructorBalances { instructor: tx-sender }) err-insufficient-balance))
+         (withdrawal-amount (get balance instructor-balance-data)))
+        
+        (asserts! (> withdrawal-amount u0) err-insufficient-balance)
+        
+        (try! (as-contract (stx-transfer? withdrawal-amount tx-sender tx-sender)))
+        
+        (map-set InstructorBalances
+            { instructor: tx-sender }
+            { balance: u0 }
+        )
+        
+        (ok withdrawal-amount)
+    )
+)
+
+(define-public (withdraw-platform-fees)
+    (let ((withdrawal-amount (var-get platform-balance)))
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (> withdrawal-amount u0) err-insufficient-balance)
+        
+        (try! (as-contract (stx-transfer? withdrawal-amount tx-sender contract-owner)))
+        
+        (var-set platform-balance u0)
+        
+        (ok withdrawal-amount)
+    )
+)
+
+(define-read-only (get-instructor-balance (instructor principal))
+    (default-to u0 (get balance (map-get? InstructorBalances { instructor: instructor })))
+)
+
+(define-read-only (get-platform-balance)
+    (var-get platform-balance)
+)
+
+(define-read-only (get-course-payment (student principal) (course-id uint))
+    (map-get? CoursePayments { student: student, course-id: course-id })
+)
+
+(define-read-only (calculate-course-fees (course-price uint))
+    (let ((platform-fee (/ (* course-price platform-fee-percentage) u100)))
+        {
+            total-price: course-price,
+            platform-fee: platform-fee,
+            instructor-share: (- course-price platform-fee)
+        }
+    )
+)
