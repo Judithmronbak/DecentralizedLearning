@@ -592,3 +592,194 @@
         }
     )
 )
+
+(define-constant err-invalid-subscription-tier (err u109))
+(define-constant err-subscription-expired (err u110))
+(define-constant err-subscription-not-found (err u111))
+(define-constant subscription-duration-blocks u1440)
+
+(define-map SubscriptionTiers
+    { tier-id: uint }
+    {
+        name: (string-ascii 50),
+        price: uint,
+        course-limit: uint,
+        duration-blocks: uint,
+        benefits: (string-ascii 200)
+    }
+)
+
+(define-map UserSubscriptions
+    { user: principal }
+    {
+        tier-id: uint,
+        start-block: uint,
+        end-block: uint,
+        courses-used: uint,
+        active: bool
+    }
+)
+
+(define-map SubscriptionCourseAccess
+    { user: principal, course-id: uint }
+    {
+        granted-at: uint,
+        subscription-tier: uint
+    }
+)
+
+(define-data-var next-tier-id uint u1)
+
+(define-public (create-subscription-tier 
+    (name (string-ascii 50)) 
+    (price uint) 
+    (course-limit uint) 
+    (duration-blocks uint) 
+    (benefits (string-ascii 200))
+)
+    (let ((tier-id (var-get next-tier-id)))
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (map-insert SubscriptionTiers
+            { tier-id: tier-id }
+            {
+                name: name,
+                price: price,
+                course-limit: course-limit,
+                duration-blocks: duration-blocks,
+                benefits: benefits
+            }
+        )
+        (var-set next-tier-id (+ tier-id u1))
+        (ok tier-id)
+    )
+)
+
+(define-public (subscribe-to-tier (tier-id uint))
+    (let
+        ((tier (unwrap! (map-get? SubscriptionTiers { tier-id: tier-id }) err-invalid-subscription-tier))
+         (subscription-price (get price tier))
+         (duration (get duration-blocks tier))
+         (current-block stacks-block-height)
+         (end-block (+ current-block duration)))
+        
+        (asserts! (> subscription-price u0) err-insufficient-payment)
+        
+        (try! (stx-transfer? subscription-price tx-sender (as-contract tx-sender)))
+        
+        (map-set UserSubscriptions
+            { user: tx-sender }
+            {
+                tier-id: tier-id,
+                start-block: current-block,
+                end-block: end-block,
+                courses-used: u0,
+                active: true
+            }
+        )
+        
+        (var-set platform-balance (+ (var-get platform-balance) subscription-price))
+        
+        (ok true)
+    )
+)
+
+(define-public (access-course-with-subscription (course-id uint))
+    (let
+        ((subscription (unwrap! (map-get? UserSubscriptions { user: tx-sender }) err-subscription-not-found))
+         (tier (unwrap! (map-get? SubscriptionTiers { tier-id: (get tier-id subscription) }) err-invalid-subscription-tier))
+         (course (unwrap! (get-course-by-id course-id) err-not-found))
+         (current-block stacks-block-height))
+        
+        (asserts! (get active subscription) err-subscription-expired)
+        (asserts! (< current-block (get end-block subscription)) err-subscription-expired)
+        (asserts! (< (get courses-used subscription) (get course-limit tier)) err-already-exists)
+        (asserts! (get active course) err-not-found)
+        
+        (map-insert StudentEnrollments
+            { student: tx-sender, course-id: course-id }
+            {
+                enrolled-at: current-block,
+                completed: false,
+                progress: u0
+            }
+        )
+        
+        (map-insert SubscriptionCourseAccess
+            { user: tx-sender, course-id: course-id }
+            {
+                granted-at: current-block,
+                subscription-tier: (get tier-id subscription)
+            }
+        )
+        
+        (map-set Courses
+            { course-id: course-id }
+            (merge course { current-students: (+ (get current-students course) u1) })
+        )
+        
+        (map-set UserSubscriptions
+            { user: tx-sender }
+            (merge subscription { courses-used: (+ (get courses-used subscription) u1) })
+        )
+        
+        (ok true)
+    )
+)
+
+(define-public (renew-subscription (tier-id uint))
+    (let
+        ((existing-subscription (unwrap! (map-get? UserSubscriptions { user: tx-sender }) err-subscription-not-found))
+         (tier (unwrap! (map-get? SubscriptionTiers { tier-id: tier-id }) err-invalid-subscription-tier))
+         (renewal-price (get price tier))
+         (duration (get duration-blocks tier))
+         (current-block stacks-block-height)
+         (new-end-block (+ current-block duration)))
+        
+        (try! (stx-transfer? renewal-price tx-sender (as-contract tx-sender)))
+        
+        (map-set UserSubscriptions
+            { user: tx-sender }
+            {
+                tier-id: tier-id,
+                start-block: current-block,
+                end-block: new-end-block,
+                courses-used: u0,
+                active: true
+            }
+        )
+        
+        (var-set platform-balance (+ (var-get platform-balance) renewal-price))
+        
+        (ok true)
+    )
+)
+
+(define-read-only (get-subscription-tier (tier-id uint))
+    (map-get? SubscriptionTiers { tier-id: tier-id })
+)
+
+(define-read-only (get-user-subscription (user principal))
+    (map-get? UserSubscriptions { user: user })
+)
+
+(define-read-only (is-subscription-active (user principal))
+    (match (map-get? UserSubscriptions { user: user })
+        subscription 
+        (and 
+            (get active subscription)
+            (< stacks-block-height (get end-block subscription))
+        )
+        false
+    )
+)
+
+(define-read-only (get-remaining-course-slots (user principal))
+    (match (map-get? UserSubscriptions { user: user })
+        subscription
+        (match (map-get? SubscriptionTiers { tier-id: (get tier-id subscription) })
+            tier (- (get course-limit tier) (get courses-used subscription))
+            u0
+        )
+        u0
+    )
+)
