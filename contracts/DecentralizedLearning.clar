@@ -783,3 +783,361 @@
         u0
     )
 )
+
+;; Peer-to-Peer Tutoring Marketplace
+;; Enables students to become tutors and offer personalized learning sessions
+
+(define-constant err-invalid-tutor-profile (err u112))
+(define-constant err-session-not-found (err u113))
+(define-constant err-session-already-booked (err u114))
+(define-constant err-session-not-booked (err u115))
+(define-constant err-insufficient-rating (err u116))
+(define-constant err-session-already-completed (err u117))
+(define-constant err-unauthorized-tutor (err u118))
+(define-constant err-invalid-session-time (err u119))
+
+;; Tutor profiles with skills and verification status
+(define-map TutorProfiles
+    { tutor: principal }
+    {
+        bio: (string-ascii 200),
+        hourly-rate: uint,
+        expertise-areas: (string-ascii 150),
+        total-sessions: uint,
+        average-rating: uint,
+        verified: bool,
+        active: bool
+    }
+)
+
+;; Tutor skill verification based on completed courses
+(define-map TutorSkillVerification
+    { tutor: principal, course-id: uint }
+    {
+        verified-at: uint,
+        credential-score: uint,
+        endorsements: uint
+    }
+)
+
+;; Tutoring session definitions and scheduling
+(define-map TutoringSessions
+    { session-id: uint }
+    {
+        tutor: principal,
+        student: (optional principal),
+        course-topic: uint,
+        session-date: uint,
+        duration-minutes: uint,
+        rate: uint,
+        status: (string-ascii 20),
+        meeting-info: (string-ascii 100)
+    }
+)
+
+;; Session payments and escrow management
+(define-map SessionPayments
+    { session-id: uint }
+    {
+        student: principal,
+        amount-escrowed: uint,
+        payment-date: uint,
+        released: bool,
+        tutor-share: uint,
+        platform-fee: uint
+    }
+)
+
+;; Session ratings and feedback
+(define-map SessionRatings
+    { session-id: uint }
+    {
+        student-rating: uint,
+        tutor-rating: uint,
+        student-feedback: (string-ascii 200),
+        tutor-feedback: (string-ascii 200),
+        completed-at: uint
+    }
+)
+
+;; Session availability slots
+(define-map TutorAvailability
+    { tutor: principal, time-slot: uint }
+    {
+        available: bool,
+        duration-minutes: uint,
+        rate-override: (optional uint)
+    }
+)
+
+(define-data-var next-session-id uint u1)
+(define-constant tutoring-platform-fee-percentage u15)
+(define-constant min-tutor-rating u350) ;; 3.5 out of 5 stars (multiplied by 100)
+
+;; Create tutor profile after course completion verification
+(define-public (create-tutor-profile 
+    (bio (string-ascii 200)) 
+    (hourly-rate uint) 
+    (expertise-areas (string-ascii 150))
+)
+    (let ((tutor-qualifications (get-tutor-course-completions tx-sender)))
+        ;; Verify tutor has completed at least one course
+        (asserts! (> tutor-qualifications u0) err-insufficient-rating)
+        (asserts! (> hourly-rate u0) err-insufficient-payment)
+        
+        (map-set TutorProfiles
+            { tutor: tx-sender }
+            {
+                bio: bio,
+                hourly-rate: hourly-rate,
+                expertise-areas: expertise-areas,
+                total-sessions: u0,
+                average-rating: u0,
+                verified: true,
+                active: true
+            }
+        )
+        (ok true)
+    )
+)
+
+;; Verify tutor skills based on course completion
+(define-public (verify-tutor-skill (tutor principal) (course-id uint))
+    (let 
+        ((credential (unwrap! (get-credential tutor course-id) err-not-found))
+         (course (unwrap! (get-course-by-id course-id) err-not-found)))
+        
+        (asserts! (get verified credential) err-not-found)
+        
+        (map-set TutorSkillVerification
+            { tutor: tutor, course-id: course-id }
+            {
+                verified-at: stacks-block-height,
+                credential-score: u100,
+                endorsements: u0
+            }
+        )
+        (ok true)
+    )
+)
+
+;; Create available tutoring session slot
+(define-public (create-tutoring-session 
+    (course-topic uint) 
+    (session-date uint) 
+    (duration-minutes uint)
+    (meeting-info (string-ascii 100))
+)
+    (let 
+        ((session-id (var-get next-session-id))
+         (tutor-profile (unwrap! (map-get? TutorProfiles { tutor: tx-sender }) err-invalid-tutor-profile)))
+        
+        (asserts! (get active tutor-profile) err-invalid-tutor-profile)
+        (asserts! (get verified tutor-profile) err-invalid-tutor-profile)
+        (asserts! (> session-date stacks-block-height) err-invalid-session-time)
+        (asserts! (>= duration-minutes u30) err-invalid-session-time)
+        (asserts! (<= duration-minutes u180) err-invalid-session-time)
+        
+        (map-insert TutoringSessions
+            { session-id: session-id }
+            {
+                tutor: tx-sender,
+                student: none,
+                course-topic: course-topic,
+                session-date: session-date,
+                duration-minutes: duration-minutes,
+                rate: (get hourly-rate tutor-profile),
+                status: "available",
+                meeting-info: meeting-info
+            }
+        )
+        
+        (var-set next-session-id (+ session-id u1))
+        (ok session-id)
+    )
+)
+
+;; Book tutoring session with payment escrow
+(define-public (book-tutoring-session (session-id uint))
+    (let 
+        ((session (unwrap! (map-get? TutoringSessions { session-id: session-id }) err-session-not-found))
+         (session-cost (calculate-session-cost (get rate session) (get duration-minutes session)))
+         (platform-fee (/ (* session-cost tutoring-platform-fee-percentage) u100))
+         (tutor-share (- session-cost platform-fee)))
+        
+        (asserts! (is-none (get student session)) err-session-already-booked)
+        (asserts! (is-eq (get status session) "available") err-session-already-booked)
+        (asserts! (> (get session-date session) stacks-block-height) err-invalid-session-time)
+        
+        ;; Transfer payment to contract escrow
+        (try! (stx-transfer? session-cost tx-sender (as-contract tx-sender)))
+        
+        ;; Update session with student booking
+        (map-set TutoringSessions
+            { session-id: session-id }
+            (merge session { 
+                student: (some tx-sender), 
+                status: "booked" 
+            })
+        )
+        
+        ;; Record payment in escrow
+        (map-insert SessionPayments
+            { session-id: session-id }
+            {
+                student: tx-sender,
+                amount-escrowed: session-cost,
+                payment-date: stacks-block-height,
+                released: false,
+                tutor-share: tutor-share,
+                platform-fee: platform-fee
+            }
+        )
+        
+        (ok true)
+    )
+)
+
+;; Complete tutoring session and release payment
+(define-public (complete-tutoring-session 
+    (session-id uint) 
+    (student-rating uint) 
+    (student-feedback (string-ascii 200))
+)
+    (let 
+        ((session (unwrap! (map-get? TutoringSessions { session-id: session-id }) err-session-not-found))
+         (payment (unwrap! (map-get? SessionPayments { session-id: session-id }) err-session-not-found))
+         (tutor (get tutor session)))
+        
+        (asserts! (is-eq (some tx-sender) (get student session)) err-unauthorized-tutor)
+        (asserts! (is-eq (get status session) "booked") err-session-already-completed)
+        (asserts! (not (get released payment)) err-session-already-completed)
+        (asserts! (>= student-rating u1) err-not-found)
+        (asserts! (<= student-rating u5) err-not-found)
+        
+        ;; Release payment to tutor
+        (try! (as-contract (stx-transfer? (get tutor-share payment) tx-sender tutor)))
+        
+        ;; Add platform fee to balance
+        (var-set platform-balance (+ (var-get platform-balance) (get platform-fee payment)))
+        
+        ;; Update session status
+        (map-set TutoringSessions
+            { session-id: session-id }
+            (merge session { status: "completed" })
+        )
+        
+        ;; Mark payment as released
+        (map-set SessionPayments
+            { session-id: session-id }
+            (merge payment { released: true })
+        )
+        
+        ;; Record student rating
+        (map-set SessionRatings
+            { session-id: session-id }
+            {
+                student-rating: student-rating,
+                tutor-rating: u0,
+                student-feedback: student-feedback,
+                tutor-feedback: "",
+                completed-at: stacks-block-height
+            }
+        )
+        
+        ;; Update tutor profile statistics
+        (update-tutor-stats tutor student-rating)
+        
+        (ok true)
+    )
+)
+
+;; Add tutor feedback after session completion
+(define-public (add-tutor-feedback 
+    (session-id uint) 
+    (tutor-rating uint) 
+    (tutor-feedback (string-ascii 200))
+)
+    (let 
+        ((session (unwrap! (map-get? TutoringSessions { session-id: session-id }) err-session-not-found))
+         (existing-rating (unwrap! (map-get? SessionRatings { session-id: session-id }) err-session-not-found)))
+        
+        (asserts! (is-eq tx-sender (get tutor session)) err-unauthorized-tutor)
+        (asserts! (is-eq (get status session) "completed") err-session-not-found)
+        (asserts! (>= tutor-rating u1) err-not-found)
+        (asserts! (<= tutor-rating u5) err-not-found)
+        
+        (map-set SessionRatings
+            { session-id: session-id }
+            (merge existing-rating { 
+                tutor-rating: tutor-rating,
+                tutor-feedback: tutor-feedback 
+            })
+        )
+        
+        (ok true)
+    )
+)
+
+;; Private helper functions
+(define-private (calculate-session-cost (hourly-rate uint) (duration-minutes uint))
+    (/ (* hourly-rate duration-minutes) u60)
+)
+
+(define-private (get-tutor-course-completions (tutor principal))
+    ;; Simplified: check if tutor has any completed courses
+    ;; In practice, would iterate through all courses to count completions
+    (if (is-some (get-credential tutor u1)) u1 u0)
+)
+
+(define-private (update-tutor-stats (tutor principal) (new-rating uint))
+    (match (map-get? TutorProfiles { tutor: tutor })
+        profile 
+        (let 
+            ((total-sessions (get total-sessions profile))
+             (current-avg (get average-rating profile))
+             (new-total (+ total-sessions u1))
+             (new-average (/ (+ (* current-avg total-sessions) (* new-rating u100)) new-total)))
+            
+            (map-set TutorProfiles
+                { tutor: tutor }
+                (merge profile { 
+                    total-sessions: new-total,
+                    average-rating: new-average 
+                })
+            )
+            true
+        )
+        false
+    )
+)
+
+;; Read-only functions for tutoring marketplace
+(define-read-only (get-tutor-profile (tutor principal))
+    (map-get? TutorProfiles { tutor: tutor })
+)
+
+(define-read-only (get-tutoring-session (session-id uint))
+    (map-get? TutoringSessions { session-id: session-id })
+)
+
+(define-read-only (get-session-payment (session-id uint))
+    (map-get? SessionPayments { session-id: session-id })
+)
+
+(define-read-only (get-session-rating (session-id uint))
+    (map-get? SessionRatings { session-id: session-id })
+)
+
+(define-read-only (is-qualified-tutor (tutor principal))
+    (match (map-get? TutorProfiles { tutor: tutor })
+        profile (and 
+            (get verified profile)
+            (get active profile)
+            (>= (get average-rating profile) min-tutor-rating)
+        )
+        false
+    )
+)
+
+
